@@ -2,7 +2,7 @@ const { Round, Bet, User, Leaderboard } = require('../models');
 
 // Assuming a single room for simplicity
 const ROOM_ID = 'room_main';
-const SOCKET_URL = process.env.SOCKET_URL || 'wss://your-backend.onrender.com';
+const SOCKET_URL = process.env.SOCKET_URL
 
 // Placeholder for current game state (in production, use DB or Redis)
 let currentGameState = {
