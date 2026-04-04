@@ -17,6 +17,7 @@ let slots = [
   { slot_index: 2, pot: 0 },
 ];
 let currentBets = []; // Store bets for current round
+console.log("socket connected")
 
 module.exports = (io) => {
   io.on('connection', (socket) => {
@@ -256,13 +257,18 @@ async function determineWinner(io, round, evaluatedSlots) {
   gamePhase = 'result';
   updateGameState({ phase: 'result' });
 
-  // After 5s, emit next_round
+  // After 5s, emit next_round and reset for next round
   setTimeout(() => {
     io.to(ROOM_ID).emit('next_round', {
       next_round_number: currentRound + 1,
-      delay_seconds: 5,
+      delay_seconds: 1,
     });
     gamePhase = 'next_round';
     updateGameState({ phase: 'next_round' });
+    
+    // Reset gamePhase back to 'betting' so next round can start
+    setTimeout(() => {
+      gamePhase = 'betting';
+    }, 1000);
   }, 5000);
 }
