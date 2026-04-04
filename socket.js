@@ -9,7 +9,7 @@ const ROOM_ID = 'room_main';
 
 let isRoundRunning = false;
 let currentRound = 0;
-let gamePhase = 'betting';
+let gamePhase = 'waiting'; // Start in waiting state
 let bettingStartTime = Date.now();
 const BETTING_DURATION = 15;
 
@@ -43,10 +43,16 @@ module.exports = (io) => {
     });
 
     // PLACE BET
-    socket.on('place_bet', async ({ room_id, slot_index, amount }) => {
-      const user = socket.user;
+    socket.on('place_bet', async ({ room_id, slot_index, amount, token }) => {
+      // Authenticate user if not already done
+      let user = socket.user;
+      if (!user && token) {
+        user = await authenticateSocket(token);
+        socket.user = user;
+      }
 
-      if (!user || gamePhase !== 'betting') {
+      if (!user || (gamePhase !== 'betting' && gamePhase !== 'waiting')) {
+        console.log('Bet rejected:', { user: !!user, gamePhase, hasToken: !!token });
         return socket.emit('error', { message: 'Invalid action' });
       }
 
@@ -106,8 +112,11 @@ module.exports = (io) => {
 
 // ROUND LOOP
 function startRoundLoop(io) {
+  console.log('🎮 Starting round loop...');
   setInterval(async () => {
-    if (!isRoundRunning) {
+    console.log(`🔄 Round loop tick - isRoundRunning: ${isRoundRunning}, gamePhase: ${gamePhase}`);
+    if (!isRoundRunning && (gamePhase === 'waiting' || gamePhase === 'betting')) {
+      console.log('🎯 Starting new round...');
       isRoundRunning = true;
 
       currentRound++;
@@ -121,9 +130,11 @@ function startRoundLoop(io) {
         round_number: currentRound,
         started_at: new Date(),
         winner_slot_index: 0,
-        winner_hand_name: '',
+        winner_hand_name: null,
         slots_data: []
       }).save();
+
+      console.log(`🎲 Round ${currentRound} started - entering betting phase`);
 
       io.to(ROOM_ID).emit('round_started', {
         round_number: currentRound,
@@ -141,6 +152,7 @@ function startRoundLoop(io) {
       });
 
       setTimeout(() => {
+        console.log(`⏰ Round ${currentRound} - moving to revealing phase`);
         gamePhase = 'revealing';
         updateGameState({ phase: 'revealing' });
         revealCards(io);
@@ -257,6 +269,7 @@ async function determineWinner(io, evaluatedSlots) {
   updateGameState({ phase: 'result' });
 
   setTimeout(() => {
+    console.log(`🏆 Round ${currentRound} - announcing next round`);
     io.to(ROOM_ID).emit('next_round', {
       next_round_number: currentRound + 1,
       delay_seconds: 1,
@@ -266,6 +279,7 @@ async function determineWinner(io, evaluatedSlots) {
     updateGameState({ phase: 'next_round' });
 
     setTimeout(() => {
+      console.log(`🔄 Round ${currentRound} completed - resetting for next round`);
       gamePhase = 'betting';
       isRoundRunning = false;
     }, 1000);
