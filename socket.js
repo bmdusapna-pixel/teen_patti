@@ -6,79 +6,87 @@ const { calculatePayout } = require('./utils/payoutCalculatorService');
 const { updateGameState } = require('./controllers/gameController');
 
 const ROOM_ID = 'room_main';
-let currentRound = 1;
-let gamePhase = 'betting'; // 'betting', 'revealing', 'result'
+
+let isRoundRunning = false;
+let currentRound = 0;
+let gamePhase = 'betting';
 let bettingStartTime = Date.now();
-const BETTING_DURATION = 15; // seconds
+const BETTING_DURATION = 15;
+
 let countdownInterval;
+let currentRoundObj = null;
+
 let slots = [
   { slot_index: 0, pot: 0 },
   { slot_index: 1, pot: 0 },
   { slot_index: 2, pot: 0 },
 ];
-let currentBets = []; // Store bets for current round
-console.log("socket connected")
+
+let currentBets = [];
 
 module.exports = (io) => {
   io.on('connection', (socket) => {
     console.log('User connected:', socket.id);
 
-    // Client emits join_room
-    socket.on('join_room', async (data) => {
-      const { room_id, user_id, token } = data;
+    // JOIN ROOM
+    socket.on('join_room', async ({ room_id, user_id, token }) => {
       const user = await authenticateSocket(token);
 
       if (!user || user._id.toString() !== user_id) {
-        socket.emit('error', { message: 'Invalid token or user' });
-        return;
+        return socket.emit('error', { message: 'Invalid token or user' });
       }
 
       socket.user = user;
       socket.join(room_id);
+
       console.log(`User ${user.username} joined room ${room_id}`);
-      // Optionally emit current state
     });
 
-    // Client emits place_bet
-    socket.on('place_bet', async (data) => {
-      const { room_id, user_id, slot_index, amount, token } = data;
-      const user = await authenticateSocket(token);
+    // PLACE BET
+    socket.on('place_bet', async ({ room_id, slot_index, amount }) => {
+      const user = socket.user;
 
-      if (!user || user._id.toString() !== user_id || gamePhase !== 'betting') {
-        socket.emit('error', { message: 'Invalid action' });
-        return;
+      if (!user || gamePhase !== 'betting') {
+        return socket.emit('error', { message: 'Invalid action' });
       }
 
-      if (user.balance < amount) {
-        socket.emit('error', { message: 'Insufficient balance' });
-        return;
+      // Slot validation
+      if (!slots[slot_index]) {
+        return socket.emit('error', { message: 'Invalid slot' });
       }
 
-      // Deduct balance
-      user.balance -= amount;
-      await user.save();
+      // Atomic balance deduction
+      const updatedUser = await User.findOneAndUpdate(
+        { _id: user._id, balance: { $gte: amount } },
+        { $inc: { balance: -amount } },
+        { new: true }
+      );
 
-      // Save bet
+      if (!updatedUser) {
+        return socket.emit('error', { message: 'Insufficient balance' });
+      }
+
+      // Create bet
       const bet = new Bet({
-        round_id: null, // Will update after round is saved
+        round_id: currentRoundObj._id,
         user_id: user._id,
         slot_index,
         amount,
-        won: false, // To be updated later
+        won: false,
         winnings: 0,
       });
+
       await bet.save();
       currentBets.push(bet);
 
       // Update pot
       slots[slot_index].pot += amount;
 
-      // Emit to sender
+      // Emit to user
       socket.emit('bet_accepted', {
         slot_index,
         amount,
-        new_balance: user.balance,
-        my_bet_on_slot: amount, // Simplified
+        new_balance: updatedUser.balance,
       });
 
       // Emit to room
@@ -88,165 +96,156 @@ module.exports = (io) => {
       });
     });
 
-    // Client emits leave_room
-    socket.on('leave_room', (data) => {
-      const { room_id, user_id } = data;
-      socket.leave(room_id);
-      console.log(`User ${user_id} left room ${room_id}`);
-    });
-
     socket.on('disconnect', () => {
       console.log('User disconnected:', socket.id);
     });
   });
 
-  // Start the round loop
   startRoundLoop(io);
 };
 
+// ROUND LOOP
 function startRoundLoop(io) {
   setInterval(async () => {
-    if (gamePhase === 'betting') {
-      // Start new round
-      currentRound++;
-      slots.forEach(slot => slot.pot = 0); // Reset pots? Or keep initial
-      bettingStartTime = Date.now();
-      currentBets = []; // Reset bets for new round
+    if (!isRoundRunning) {
+      isRoundRunning = true;
 
-      // Create Round object (save later)
-      const round = new Round({
+      currentRound++;
+      slots.forEach(s => s.pot = 0);
+      currentBets = [];
+      bettingStartTime = Date.now();
+
+      // SAVE ROUND IMMEDIATELY
+      currentRoundObj = await new Round({
         room_id: ROOM_ID,
         round_number: currentRound,
         started_at: new Date(),
-        winner_slot_index: 0, // Placeholder
-        winner_hand_name: 'High Card', // Placeholder
-        ended_at: new Date(), // Placeholder, will update
-        slots_data: slots.map(slot => ({ slot_index: slot.slot_index, pot: slot.pot, cards: [], hand_name: 'High Card' })), // Placeholder
-      });
+        winner_slot_index: 0,
+        winner_hand_name: '',
+        slots_data: []
+      }).save();
 
-      // Store round for later use
-      currentRoundObj = round;
-
-      // Emit round_started
       io.to(ROOM_ID).emit('round_started', {
         round_number: currentRound,
         betting_duration: BETTING_DURATION,
-        slots: slots.map(slot => ({ slot_index: slot.slot_index, initial_pot: slot.pot })),
+        slots
       });
 
-      // Start countdown
       startCountdown(io);
 
       gamePhase = 'betting';
-      updateGameState({ current_round: currentRound, phase: 'betting', betting_start_time: bettingStartTime });
+      updateGameState({
+        current_round: currentRound,
+        phase: 'betting',
+        betting_start_time: bettingStartTime
+      });
 
-      // After betting duration, move to revealing
       setTimeout(() => {
         gamePhase = 'revealing';
         updateGameState({ phase: 'revealing' });
-        revealCards(io, round);
+        revealCards(io);
       }, BETTING_DURATION * 1000);
-
     }
-  }, (BETTING_DURATION + 4 + 5 + 1) * 1000); // Full cycle time
+  }, (BETTING_DURATION + 10) * 1000);
 }
 
+// COUNTDOWN
 function startCountdown(io) {
+  if (countdownInterval) clearInterval(countdownInterval);
+
   let seconds = BETTING_DURATION;
+
   countdownInterval = setInterval(() => {
     io.to(ROOM_ID).emit('countdown_tick', { seconds });
     seconds--;
+
     if (seconds < 0) clearInterval(countdownInterval);
   }, 1000);
 }
 
-async function revealCards(io, round) {
-  // Deal cards
-  const dealtSlots = dealCards(); // [{ cards: [...] }, ...]
+// REVEAL CARDS
+async function revealCards(io) {
+  const dealtSlots = dealCards();
 
-  // Evaluate hands
   const evaluatedSlots = dealtSlots.map((slot, index) => {
     const hand = evaluateHand(slot.cards);
+
     return {
       slot_index: index,
       hand_name: hand.hand_name,
+      rank_score: hand.rank_score,
+      tieBreaker: hand.tieBreaker,
       cards: slot.cards,
       pot: slots[index].pot,
     };
   });
 
-  // Update round (don't save yet)
-  round.slots_data = evaluatedSlots;
-  // await round.save(); // Remove this, save in determineWinner
+  currentRoundObj.slots_data = evaluatedSlots;
 
-  // Update bets with round_id
-  for (const bet of currentBets) {
-    bet.round_id = round._id;
-    await bet.save();
-  }
-
-  // Emit cards_revealed
   io.to(ROOM_ID).emit('cards_revealed', {
-    slots: evaluatedSlots.map(slot => ({
-      slot_index: slot.slot_index,
-      hand_name: slot.hand_name,
-      cards: slot.cards,
-    })),
+    slots: evaluatedSlots.map(s => ({
+      slot_index: s.slot_index,
+      hand_name: s.hand_name,
+      cards: s.cards
+    }))
   });
 
-  // After 4s, emit round_result
   setTimeout(() => {
-    determineWinner(io, round, evaluatedSlots);
+    determineWinner(io, evaluatedSlots);
   }, 4000);
 }
 
-async function determineWinner(io, round, evaluatedSlots) {
-  // Find winner (highest rank, then tie-breaker)
+// DETERMINE WINNER
+async function determineWinner(io, evaluatedSlots) {
   let winnerSlot = 0;
   let maxRank = 0;
   let maxTieBreaker = 0;
 
-  evaluatedSlots.forEach((slot, index) => {
-    const hand = evaluateHand(slot.cards);
-    if (hand.rank_score > maxRank || (hand.rank_score === maxRank && hand.tieBreaker > maxTieBreaker)) {
-      maxRank = hand.rank_score;
-      maxTieBreaker = hand.tieBreaker;
-      winnerSlot = index;
+  evaluatedSlots.forEach(slot => {
+    if (
+      slot.rank_score > maxRank ||
+      (slot.rank_score === maxRank && slot.tieBreaker > maxTieBreaker)
+    ) {
+      maxRank = slot.rank_score;
+      maxTieBreaker = slot.tieBreaker;
+      winnerSlot = slot.slot_index;
     }
   });
 
-  round.winner_slot_index = winnerSlot;
-  round.winner_hand_name = evaluatedSlots[winnerSlot].hand_name;
-  round.ended_at = new Date();
-  await round.save();
+  currentRoundObj.winner_slot_index = winnerSlot;
+  currentRoundObj.winner_hand_name = evaluatedSlots[winnerSlot].hand_name;
+  currentRoundObj.ended_at = new Date();
 
-  // Calculate payouts
+  await currentRoundObj.save();
+
   const winnerPot = evaluatedSlots[winnerSlot].pot;
-  const bets = await Bet.find({ round_id: round._id });
+  const bets = await Bet.find({ round_id: currentRoundObj._id });
 
   let biggestWinners = [];
+
   for (const bet of bets) {
     if (bet.slot_index === winnerSlot) {
       bet.won = true;
-      bet.winnings = bet.amount * 2; // As per cheat sheet
+      bet.winnings = calculatePayout(bet.amount, winnerPot);
+
       const user = await User.findById(bet.user_id);
       user.balance += bet.winnings;
       user.total_winnings += bet.winnings;
       await user.save();
+
       biggestWinners.push({
         user_id: user._id,
         display_name: user.display_name,
         win_amount: bet.winnings,
       });
     }
+
     await bet.save();
   }
 
-  // Sort biggest winners
   biggestWinners.sort((a, b) => b.win_amount - a.win_amount);
-  biggestWinners = biggestWinners.slice(0, 3); // Top 3
+  biggestWinners = biggestWinners.slice(0, 3);
 
-  // Emit round_result
   io.to(ROOM_ID).emit('round_result', {
     round_number: currentRound,
     winner_slot_index: winnerSlot,
@@ -257,18 +256,19 @@ async function determineWinner(io, round, evaluatedSlots) {
   gamePhase = 'result';
   updateGameState({ phase: 'result' });
 
-  // After 5s, emit next_round and reset for next round
   setTimeout(() => {
     io.to(ROOM_ID).emit('next_round', {
       next_round_number: currentRound + 1,
       delay_seconds: 1,
     });
+
     gamePhase = 'next_round';
     updateGameState({ phase: 'next_round' });
-    
-    // Reset gamePhase back to 'betting' so next round can start
+
     setTimeout(() => {
       gamePhase = 'betting';
+      isRoundRunning = false;
     }, 1000);
+
   }, 5000);
 }
