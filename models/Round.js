@@ -57,16 +57,15 @@ const roundSchema = new mongoose.Schema(
       type: Number,
       min: 0,
       max: 2,
-      required: true,
+      default: 0, // Will be updated when winner is determined
     },
     winner_hand_name: {
       type: String,
-      enum: ['Straight Flush', 'Trail', 'Flush', 'Straight', 'Pair', 'High Card'],
-      required: true,
+      default: null, // Will be set when winner is determined
     },
     slots_data: {
       type: [slotDataSchema],
-      required: true,
+      default: [], // Will be updated when cards are revealed
     },
     started_at: {
       type: Date,
@@ -74,7 +73,7 @@ const roundSchema = new mongoose.Schema(
     },
     ended_at: {
       type: Date,
-      required: true,
+      default: null, // Will be set when round ends
     },
   },
   { timestamps: true }

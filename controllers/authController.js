@@ -42,7 +42,7 @@ const loginUser = async (req, res) => {
 
 const loginByUserId = async (req, res) => {
   try {
-    const userId = "69d0dae36e17587bbaaeb206";
+    const { userId } = req.body;
 
     // 🔴 Validation
     if (!userId) {

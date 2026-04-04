@@ -226,7 +226,7 @@ async function determineWinner(io, evaluatedSlots) {
   for (const bet of bets) {
     if (bet.slot_index === winnerSlot) {
       bet.won = true;
-      bet.winnings = calculatePayout(bet.amount, winnerPot);
+      bet.winnings = bet.amount * 2; // Simple 2x payout for winners
 
       const user = await User.findById(bet.user_id);
       user.balance += bet.winnings;
