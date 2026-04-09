@@ -163,14 +163,53 @@ class GameService {
   }
 
   async calculateResult() {
-
     const totals = this.currentRound.totals;
     const totalBet = totals.A + totals.B + totals.C;
 
+
+    const BIG_BET_THRESHOLD = 200000;
+    const RECOVERY_THRESHOLD = 500000;
+
+
+    const date = this.getCurrentDate();
+    const dailyStat = await DailyStat.findOne({ date });
+    const netLoss = dailyStat ? (dailyStat.totalHouseLoss - dailyStat.totalHouseProfit) : 0;
+    const isRecoveryMode = netLoss >= RECOVERY_THRESHOLD;
+
     const options = [0, 1, 2];
 
-    options.sort((a, b) => totals[SYMBOLS[a]] - totals[SYMBOLS[b]]);
-    const targetSlotIndex = options[0];
+    const bigBetSlot = options.find(i => totals[SYMBOLS[i]] >= BIG_BET_THRESHOLD);
+
+    let targetSlotIndex;
+
+    if (totalBet === 0) {
+
+      targetSlotIndex = Math.floor(Math.random() * 3);
+    } else if (isRecoveryMode) {
+
+      const sortedOptions = [...options].sort((a, b) => totals[SYMBOLS[a]] - totals[SYMBOLS[b]]);
+      targetSlotIndex = sortedOptions[0];
+    } else if (bigBetSlot !== undefined) {
+
+      if (Math.random() < 0.70) {
+
+        const otherSlots = options.filter(i => i !== bigBetSlot);
+        targetSlotIndex = otherSlots[Math.floor(Math.random() * otherSlots.length)];
+      } else {
+
+        targetSlotIndex = Math.floor(Math.random() * 3);
+      }
+    } else {
+
+      if (Math.random() < 0.40) {
+
+        targetSlotIndex = Math.floor(Math.random() * 3);
+      } else {
+
+        const sortedOptions = [...options].sort((a, b) => totals[SYMBOLS[a]] - totals[SYMBOLS[b]]);
+        targetSlotIndex = sortedOptions[0];
+      }
+    }
 
     const deck = this.createShuffledDeck();
     let hands = [
@@ -259,15 +298,14 @@ class GameService {
       }
     }
 
-    // Update Daily Statistics
+
     await this.updateDailyStats();
   }
 
   async updateDailyStats() {
     const totalInvested = Object.values(this.currentRound.totals).reduce((a, b) => a + b, 0);
     let totalPayout = 0;
-    
-    // Calculate total payout for the round
+
     for (const bet of this.betsCache) {
       if (bet.side === this.lastResult?.winner) {
         totalPayout += bet.amount * 2;
@@ -279,8 +317,8 @@ class GameService {
 
     await DailyStat.findOneAndUpdate(
       { date },
-      { 
-        $inc: { 
+      {
+        $inc: {
           totalHouseProfit: netProfit > 0 ? netProfit : 0,
           totalHouseLoss: netProfit < 0 ? Math.abs(netProfit) : 0
         }
