@@ -1,127 +1,197 @@
-const { Round, Bet, User, Leaderboard } = require('../models');
+import User from '../models/User.js';
+import Bet from '../models/Bet.js';
+import RoundResult from '../models/RoundResult.js';
+import gameService from '../services/gameService.js';
 
-// Assuming a single room for simplicity
-const ROOM_ID = 'room_main';
-const SOCKET_URL = process.env.SOCKET_URL
+const MIN_BET = 100;
+const MAX_BET = 100000000;
+const GAME_TAG = "teenpatti";
 
-// Placeholder for current game state (in production, use DB or Redis)
-let currentGameState = {
-    current_round: 1,
-    phase: 'betting', // 'betting' | 'revealing' | 'result'
-    betting_start_time: Date.now(),
-    betting_duration: 15, // seconds
+const normalizeUserId = (value) => String(value || '').trim();
+
+export const getWallet = async (req, res) => {
+  const userId = normalizeUserId(req.params.userId);
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  try {
+    const user = await User.findOne({ firebaseUid: userId }).select('coin uniqueId name');
+    if (!user) return res.status(404).json({ error: "User not found" });
+    res.json({ coin: user.coin });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
 };
 
-const getCurrentRoom = async (req, res) => {
-    try {
-        // Calculate seconds left in betting phase
-        let betting_seconds_left = 0;
-        if (currentGameState.phase === 'betting') {
-            const elapsed = Math.floor((Date.now() - currentGameState.betting_start_time) / 1000);
-            betting_seconds_left = Math.max(0, currentGameState.betting_duration - elapsed);
-        }
+export const getCurrentRound = (req, res) => {
+  const round = gameService.getCurrentRound();
+  res.json({
+    roundId: round.roundId,
+    time: round.time,
+    status: round.status,
+    totals: round.totals
+  });
+};
 
-        res.json({
-            room_id: ROOM_ID,
-            socket_url: SOCKET_URL,
-            current_round: currentGameState.current_round,
-            betting_seconds_left,
-            phase: currentGameState.phase,
-        });
-    } catch (error) {
-        res.status(500).json({ message: 'Server error' });
+export const getHistory = async (req, res) => {
+  const userId = normalizeUserId(req.params.userId);
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 20;
+  const skip = (page - 1) * limit;
+  const statusFilter = req.query.status;
+  const query = { userId, game: GAME_TAG };
+  if (statusFilter === "pending" || statusFilter === "settled") {
+    query.status = statusFilter;
+  } else {
+    query.status = "settled";
+  }
+
+  try {
+    const total = await Bet.countDocuments(query);
+    const bets = await Bet.find(query)
+      .sort({ createdAt: -1, timestamp: -1 })
+      .skip(skip)
+      .limit(limit);
+
+    res.json({
+      data: bets.map(bet => ({
+        settlementStatus: bet.status,
+        roundId: bet.roundId,
+        side: bet.side,
+        amount: bet.amount,
+        won: bet.status === "settled" ? bet.won : null,
+        win: bet.status === "settled" ? bet.won : null,
+        isWin: bet.status === "settled" ? bet.won : null,
+        payout: bet.payout,
+        net: bet.status === "settled" ? (bet.payout - bet.amount) : 0,
+        result: bet.status === "settled"
+          ? (bet.won ? "win" : "loss")
+          : "pending",
+        status: bet.status === "settled"
+          ? (bet.won ? "win" : "loss")
+          : "pending",
+        timestamp: bet.timestamp
+      })),
+      pagination: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit)
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+};
+
+const processSingleBetREST = async (betItem) => {
+  const userId = betItem.userId;
+  const { roundId, side, amount } = betItem;
+  const selectedSymbol = side;
+  const parsedAmount = Math.floor(parseInt(amount));
+
+  if (!userId) throw new Error("userId required");
+  if (!parsedAmount || isNaN(parsedAmount) || parsedAmount <= 0) throw new Error("Invalid amount");
+  if (parsedAmount < MIN_BET) throw new Error(`Minimum bet ${MIN_BET}`);
+  if (parsedAmount > MAX_BET) throw new Error("Maximum bet 10 Crore");
+
+  const currentRound = gameService.getCurrentRound();
+  const validSymbols = ["A", "B", "C"];
+
+  if (!selectedSymbol || !validSymbols.includes(selectedSymbol)) throw new Error("Invalid selection");
+  if (roundId !== currentRound.roundId) throw new Error("Round expired");
+  if (currentRound.status !== "betting" || currentRound.time <= 1) throw new Error("Betting is closed");
+
+  const user = await User.findOneAndUpdate(
+    { firebaseUid: userId, coin: { $gte: parsedAmount }, isBlock: false },
+    { $inc: { coin: -parsedAmount } },
+    { new: true }
+  );
+
+  if (!user) throw new Error(`Insufficient coins for ${selectedSymbol}`);
+
+  const symbolIndex = validSymbols.indexOf(selectedSymbol);
+  const betData = {
+    game: GAME_TAG,
+    userId,
+    roundId,
+    side: selectedSymbol,
+    sideIndex: symbolIndex,
+    amount: parsedAmount,
+    timestamp: Date.now(),
+    won: false,
+    payout: 0,
+    status: "pending"
+  };
+
+  const newBet = await Bet.create(betData);
+  betData._id = newBet._id;
+
+  try {
+    gameService.addBetToCache(betData);
+    return { success: true, message: "Bet placed!", coin: user.coin, side: selectedSymbol };
+  } catch (cacheErr) {
+    await User.findOneAndUpdate({ firebaseUid: userId }, { $inc: { coin: parsedAmount } });
+    await Bet.deleteOne({ _id: newBet._id });
+    throw cacheErr;
+  }
+};
+
+export const placeBet = async (req, res) => {
+  try {
+    const data = req.body;
+    const betsToProcess = Array.isArray(data) ? data : [data];
+    const results = [];
+
+    for (const b of betsToProcess) {
+      try {
+        const resObj = await processSingleBetREST(b);
+        results.push(resObj);
+      } catch (err) {
+        results.push({ success: false, message: err.message, side: b.side });
+      }
     }
-};
 
-const getHistory = async (req, res) => {
-    try {
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 20;
-        const skip = (page - 1) * limit;
+    const anySucceeded = results.some(r => r.success);
+    const allFailed = results.every(r => !r.success);
 
-        const rounds = await Round.find({ room_id: ROOM_ID })
-            .sort({ round_number: -1 })
-            .skip(skip)
-            .limit(limit)
-            .select('round_number winner_slot_index winner_hand_name started_at');
-
-        const total = await Round.countDocuments({ room_id: ROOM_ID });
-
-        const results = rounds.map(round => ({
-            round_number: round.round_number,
-            winner_slot_index: round.winner_slot_index,
-            winner_icon: '☕', // Placeholder, can map based on slot
-            winner_hand_name: round.winner_hand_name,
-            played_at: round.started_at,
-        }));
-
-        res.json({ results, total });
-    } catch (error) {
-        res.status(500).json({ message: 'Server error' });
+    if (allFailed && betsToProcess.length > 0) {
+      return res.status(400).json({ success: false, results });
     }
+
+    res.json({ success: anySucceeded, results });
+  } catch (err) {
+    console.error("HTTP Bet error:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
 };
 
-const getRoundResult = async (req, res) => {
-    try {
-        const { roundId } = req.params;
-        const user = req.user;
+export const getRecentResults = async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 20;
+  const skip = (page - 1) * limit;
 
-        const round = await Round.findOne({ round_number: parseInt(roundId), room_id: ROOM_ID });
-        if (!round) {
-            return res.status(404).json({ message: 'Round not found' });
-        }
+  try {
+    const total = await RoundResult.countDocuments({ game: GAME_TAG });
+    const results = await RoundResult.find({ game: GAME_TAG })
+      .sort({ timestamp: -1 })
+      .skip(skip)
+      .limit(limit);
 
-        const userBets = await Bet.find({ round_id: round._id, user_id: user._id });
-        const my_bet = userBets.reduce((sum, bet) => sum + bet.amount, 0);
-        const my_winnings = userBets.reduce((sum, bet) => sum + bet.winnings, 0);
-
-        // Assuming balance before/after can be calculated (simplified)
-        const balance_before = user.balance + my_bet - my_winnings; // Rough estimate
-        const balance_after = user.balance;
-
-        res.json({
-            round_number: round.round_number,
-            winner_slot_index: round.winner_slot_index,
-            my_bet,
-            my_winnings,
-            balance_before,
-            balance_after,
-        });
-    } catch (error) {
-        res.status(500).json({ message: 'Server error' });
-    }
+    res.json({
+      data: results,
+      pagination: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit)
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
 };
 
-const getLeaderboard = async (req, res) => {
-    try {
-        // Aggregate total winnings from users
-        const entries = await User.find({ is_guest: false })
-            .sort({ total_winnings: -1 })
-            .limit(5)
-            .select('display_name total_winnings');
-
-        const leaderboard = entries.map((user, index) => ({
-            rank: index + 1,
-            user_id: user._id,
-            display_name: user.display_name.length > 10 ? user.display_name.substring(0, 10) + '...' : user.display_name,
-            total_winnings: user.total_winnings,
-        }));
-
-        res.json({ entries: leaderboard });
-    } catch (error) {
-        res.status(500).json({ message: 'Server error' });
-    }
-};
-
-// Function to update game state (call from socket.js)
-const updateGameState = (newState) => {
-    currentGameState = { ...currentGameState, ...newState };
-};
-
-module.exports = {
-    getCurrentRoom,
-    getHistory,
-    getRoundResult,
-    getLeaderboard,
-    updateGameState,
+export const getRoundStats = (req, res) => {
+  const round = gameService.getCurrentRound();
+  res.json({ roundId: round.roundId, totals: round.totals });
 };

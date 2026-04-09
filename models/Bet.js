@@ -1,44 +1,20 @@
-const mongoose = require('mongoose');
+import mongoose from 'mongoose';
 
-const betSchema = new mongoose.Schema(
-  {
-    round_id: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'Round',
-      required: true,
-    },
-    user_id: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
-      required: true,
-    },
-    slot_index: {
-      type: Number,
-      min: 0,
-      max: 2,
-      required: true,
-    },
-    amount: {
-      type: Number,
-      required: true,
-      min: 0,
-    },
-    won: {
-      type: Boolean,
-      required: true,
-    },
-    winnings: {
-      type: Number,
-      required: true,
-      default: 0,
-      min: 0,
-    },
-    placed_at: {
-      type: Date,
-      default: Date.now,
-    },
-  },
-  { timestamps: true }
-);
+const betSchema = new mongoose.Schema({
+  game: { type: String, default: "teenpatti", index: true },
+  userId: { type: String, required: true },
+  roundId: { type: String, required: true },
+  side: { type: String, enum: ["A", "B", "C"], required: true },
+  amount: { type: Number, required: true },
+  won: { type: Boolean, default: false },
+  payout: { type: Number, default: 0 },
+  status: { type: String, enum: ["pending", "settled"], default: "pending" },
+  timestamp: { type: Date, default: Date.now },
+}, { timestamps: true });
 
-module.exports = mongoose.model('Bet', betSchema);
+betSchema.index({ userId: 1, game: 1, createdAt: -1 });
+betSchema.index({ roundId: 1, game: 1 });
+
+
+const Bet = mongoose.model('Bet', betSchema);
+export default Bet;
