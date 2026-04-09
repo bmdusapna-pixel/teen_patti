@@ -82,8 +82,8 @@ class GameService {
 
   async startResultPhase() {
     this.currentRound.status = "result";
-    this.currentRound.time = 10;
-    this.io.emit('statusChange', { status: "result", time: 10 });
+    this.currentRound.time = 5;
+    this.io.emit('statusChange', { status: "result", time: 5 });
 
     const result = await this.calculateResult();
 
