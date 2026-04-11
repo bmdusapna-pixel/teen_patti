@@ -247,24 +247,31 @@ class GameService {
 
   async settleBets(result) {
     const winnerSymbol = result.winner;
-    const winningsMap = new Map();
+    const winningsMap = new Map();  // userId → totalPayout
+    const losersMap = new Map();    // userId → totalLost
 
+    // Step 1 — Classify winners aur losers
     for (const bet of this.betsCache) {
       const isWin = bet.side === winnerSymbol;
       const payout = isWin ? bet.amount * 2 : 0;
 
+      // Bet settle karo DB mein
       await Bet.updateOne(
         { _id: bet._id },
         { $set: { won: isWin, payout, status: "settled" } }
       );
 
       if (isWin) {
-        const currentWon = winningsMap.get(bet.userId) || 0;
-        winningsMap.set(bet.userId, currentWon + payout);
+        const prev = winningsMap.get(bet.userId) || 0;
+        winningsMap.set(bet.userId, prev + payout);
+      } else {
+        // ✅ Loser track karo
+        const prev = losersMap.get(bet.userId) || 0;
+        losersMap.set(bet.userId, prev + bet.amount);
       }
     }
 
-    // Winners — coin credit
+    // Step 2 — Winners: coin credit
     for (const [userId, totalPayout] of winningsMap.entries()) {
       const user = await User.findOneAndUpdate(
         { firebaseUid: userId },
@@ -283,30 +290,23 @@ class GameService {
       }
     }
 
-    // Losers — spentCoins update ✅
-    const betters = new Set(this.betsCache.map(b => b.userId));
-    for (const userId of betters) {
-      if (!winningsMap.has(userId)) {
-        // Is user ne kitna lose kiya
-        const lostAmount = this.betsCache
-          .filter(b => b.userId === userId)
-          .reduce((acc, b) => acc + b.amount, 0);
+    // Step 3 — Losers: spentCoins update ✅
+    for (const [userId, lostAmount] of losersMap.entries()) {
+      // ✅ Socket hai ya nahi — dono case mein spentCoins update hoga
+      const user = await User.findOneAndUpdate(
+        { firebaseUid: userId },
+        { $inc: { spentCoins: lostAmount } }, // ✅ spentCoins increment
+        { new: true }
+      );
 
-        const user = await User.findOneAndUpdate(
-          { firebaseUid: userId },
-          { $inc: { spentCoins: lostAmount } }, // ✅ lost amount spentCoins mein add
-          { new: true }
-        );
-
-        const socketId = this.socketMappings.get(userId);
-        if (socketId && this.io) {
-          this.io.to(socketId).emit('betSettled', {
-            roundId: this.currentRound.roundId,
-            won: false,
-            payout: 0,
-            coin: user ? user.coin : 0
-          });
-        }
+      const socketId = this.socketMappings.get(userId);
+      if (socketId && this.io) {
+        this.io.to(socketId).emit('betSettled', {
+          roundId: this.currentRound.roundId,
+          won: false,
+          payout: 0,
+          coin: user ? user.coin : 0
+        });
       }
     }
 
