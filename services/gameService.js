@@ -264,6 +264,7 @@ class GameService {
       }
     }
 
+    // Winners — coin credit
     for (const [userId, totalPayout] of winningsMap.entries()) {
       const user = await User.findOneAndUpdate(
         { firebaseUid: userId },
@@ -282,12 +283,23 @@ class GameService {
       }
     }
 
+    // Losers — spentCoins update ✅
     const betters = new Set(this.betsCache.map(b => b.userId));
     for (const userId of betters) {
       if (!winningsMap.has(userId)) {
+        // Is user ne kitna lose kiya
+        const lostAmount = this.betsCache
+          .filter(b => b.userId === userId)
+          .reduce((acc, b) => acc + b.amount, 0);
+
+        const user = await User.findOneAndUpdate(
+          { firebaseUid: userId },
+          { $inc: { spentCoins: lostAmount } }, // ✅ lost amount spentCoins mein add
+          { new: true }
+        );
+
         const socketId = this.socketMappings.get(userId);
         if (socketId && this.io) {
-          const user = await User.findOne({ firebaseUid: userId }).select('coin');
           this.io.to(socketId).emit('betSettled', {
             roundId: this.currentRound.roundId,
             won: false,
@@ -297,7 +309,6 @@ class GameService {
         }
       }
     }
-
 
     await this.updateDailyStats();
   }
